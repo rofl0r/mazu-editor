@@ -484,6 +484,7 @@ struct {
     selection_state_t selection; /* Text selection state */
     bool show_line_numbers;      /* Toggle line numbers display */
     bool last_was_cut;           /* True if previous key was ^K (for appending cuts) */
+    bool syntax_dirty;           /* true when Tree-sitter highlight needs recompute */
     struct {
         char *query;             /* Persists across ^W invocations; NULL until first search */
         size_t query_len;
@@ -524,6 +525,7 @@ struct {
         },
     .show_line_numbers = false,
     .last_was_cut = false,
+    .syntax_dirty = true,
     .search = { .query = NULL, .query_len = 0, .query_cap = 0, .mode = SM_NONE,
                 .replace_query = NULL, .replace_len = 0, .replace_cap = 0,
                 /* orig_row=-1 means "no active replace cycle"; orig_char is only
@@ -1197,8 +1199,10 @@ static void syntax_highlight(editor_row_t *row, int row_idx)
 
     if (!syntax_prepare_all_rows())
         return;
-    if (!ec.syntax || NR <= 0)
+    if (!ec.syntax || NR <= 0) {
+        ec.syntax_dirty = false;
         return;
+    }
     if (!syntax_tree_sitter_prepare())
         return;
 
@@ -1242,6 +1246,7 @@ static void syntax_highlight(editor_row_t *row, int row_idx)
     ts_tree_delete(tree);
     free(source);
     free(row_offsets);
+    ec.syntax_dirty = false;
 }
 
 /* Reference: https://misc.flogisoft.com/bash/tip_colors_and_formatting */
@@ -1262,6 +1267,7 @@ static int syntax_token_color(int highlight)
 static void syntax_select(void)
 {
     ec.syntax = NULL;
+    ec.syntax_dirty = true;
     if (!ec.file_name)
         return;
     for (size_t j = 0; j < DB_ENTRIES; j++) {
@@ -1273,12 +1279,10 @@ static void syntax_select(void)
             int pat_len = strlen(es->file_match[i]);
             if ((es->file_match[i][0] != '.') || (p[pat_len] == '\0')) {
                 ec.syntax = es;
-                syntax_highlight(NULL, 0);
                 return;
             }
         }
     }
-    syntax_highlight(NULL, 0);
 }
 
 static int row_cursorx_to_renderx(editor_row_t *row, int cursor_x)
@@ -1349,6 +1353,7 @@ static int row_renderx_to_cursorx(editor_row_t *row, int render_x)
 
 static void row_update(editor_row_t *row, int row_idx)
 {
+    (void) row_idx;
     int tabs = 0;
     int wide_chars = 0;
     bool direct_map = true;
@@ -1402,7 +1407,9 @@ static void row_update(editor_row_t *row, int row_idx)
     }
     row->render[idx] = '\0';
     row->render_size = idx;
-    syntax_highlight(row, row_idx);
+    if (!syntax_prepare_row_highlight(row))
+        ui_set_message("Memory allocation failed");
+    ec.syntax_dirty = true;
 }
 
 static void row_insert(int at, const char *s, size_t line_len)
@@ -3026,6 +3033,10 @@ static void ui_draw_rows(editor_buf_t *eb)
 
 static void editor_refresh(void)
 {
+    /* Re-run Tree-sitter at most once per refresh to avoid O(N^2) work while
+     * loading/updating many rows. */
+    if (ec.syntax_dirty)
+        syntax_highlight(NULL, 0);
     editor_scroll();
     editor_buf_t eb = {NULL, 0};
     buf_append(&eb, "\x1b[?25l", 6);
