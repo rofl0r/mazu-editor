@@ -2,7 +2,7 @@ CFLAGS = -Wall -std=gnu99
 CPPFLAGS += -Ithird_party/tree-sitter/lib/include \
 	    -Ithird_party/tree-sitter-c/src \
 	    -DUPRV_BLOCK_MACRO_BEGIN=do \
-	    -DUPRV_BLOCK_MACRO_END=while\(0\)
+	    -DUPRV_BLOCK_MACRO_END='while(0)'
 
 .PHONY: all clean check
 

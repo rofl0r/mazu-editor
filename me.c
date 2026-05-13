@@ -1351,9 +1351,8 @@ static int row_renderx_to_cursorx(editor_row_t *row, int render_x)
     return byte_pos;
 }
 
-static void row_update(editor_row_t *row, int row_idx)
+static void row_update(editor_row_t *row)
 {
-    (void) row_idx;
     int tabs = 0;
     int wide_chars = 0;
     bool direct_map = true;
@@ -1430,7 +1429,7 @@ static void row_insert(int at, const char *s, size_t line_len)
         ui_set_message("Memory allocation failed");
         return;
     }
-    row_update(ROW(at), at);
+    row_update(ROW(at));
     ec.modified = true;
 }
 
@@ -1500,7 +1499,7 @@ static bool undo_insert_bytes(int row_idx, int col, const char *s, size_t len)
     memmove(&row->chars[col + len], &row->chars[col], (size_t)(row->size - col) + 1);
     memcpy(&row->chars[col], s, len);
     row->size += (int)len;
-    row_update(row, row_idx);
+    row_update(row);
     return true;
 }
 
@@ -1528,7 +1527,7 @@ static bool undo_apply_insert_text(int row, int col, const char *text, size_t le
             r = ROW(y);
             r->size = x;
             r->chars[x] = '\0';
-            row_update(r, y);
+            row_update(r);
             y++;
             x = 0;
             i++;
@@ -1547,7 +1546,7 @@ static bool undo_delete_bytes(int row_idx, int col, size_t len)
         return false;
     memmove(&row->chars[col], &row->chars[col + len], (size_t)(row->size - col) - len + 1);
     row->size -= (int)len;
-    row_update(row, row_idx);
+    row_update(row);
     return true;
 }
 
@@ -1577,7 +1576,7 @@ static bool undo_apply_delete_text(int row, int col, const char *text, size_t le
             r->chars = nc;
             memcpy(&r->chars[r->size], next->chars, (size_t)next->size + 1);
             r->size += next->size;
-            row_update(r, y);
+            row_update(r);
             row_erase(y + 1);
             i++;
         }
@@ -1637,7 +1636,7 @@ static bool undo_apply_replace_span(int row, int col, size_t from_len,
         memcpy(&r->chars[col], to_text, to_len);
     r->size = (int)new_size;
     r->chars[r->size] = '\0';
-    row_update(r, row);
+    row_update(r);
     ec.modified = true;
     return true;
 }
@@ -1789,7 +1788,7 @@ static void editor_cut(bool append)
         row->chars = nc;
         row->size = 0;
         row->chars[0] = '\0';
-        row_update(row, ec.cursor_y);
+        row_update(row);
     }
 
     /* Adjust cursor */
@@ -2061,7 +2060,7 @@ static void selection_delete(void)
         if (row && end_x > start_x) {
             memmove(&row->chars[start_x], &row->chars[end_x], row->size - end_x + 1);
             row->size -= end_x - start_x;
-            row_update(row, start_y);
+            row_update(row);
             ec.modified = true;
         }
     } else {
@@ -2079,7 +2078,7 @@ static void selection_delete(void)
             memcpy(&start_row->chars[start_x], &end_row->chars[end_x], suffix_len);
             start_row->size = start_x + suffix_len;
             start_row->chars[start_row->size] = '\0';
-            row_update(start_row, start_y);
+            row_update(start_row);
             for (int y = end_y; y > start_y; y--)
                 row_erase(y);
             ec.modified = true;
@@ -2122,7 +2121,7 @@ static void editor_newline(void)
         row = ROW(ec.cursor_y);
         row->size = ec.cursor_x;
         row->chars[row->size] = '\0';
-        row_update(row, ec.cursor_y);
+        row_update(row);
     }
     ec.cursor_y++;
     ec.cursor_x = 0;
@@ -2191,7 +2190,7 @@ static void editor_insert_char(int c, bool manual_typing)
             row->size - ec.cursor_x + 1);
     memcpy(&row->chars[ec.cursor_x], utf8_buffer.bytes, utf8_buffer.len);
     row->size += utf8_buffer.len;
-    row_update(row, ec.cursor_y);
+    row_update(row);
     ec.cursor_x += utf8_buffer.len;
     ec.modified = true;
     if (!g_undo.replaying && !g_undo.batching) {
@@ -2223,7 +2222,7 @@ static void editor_delete_char(void)
         memmove(&row->chars[prev_pos], &row->chars[ec.cursor_x],
                 row->size - ec.cursor_x + 1);
         row->size -= char_len;
-        row_update(row, ec.cursor_y);
+        row_update(row);
         ec.cursor_x = prev_pos;
         ec.modified = true;
         if (deleted) {
@@ -2245,7 +2244,7 @@ static void editor_delete_char(void)
             memcpy(&prev_row->chars[prev_row->size], row->chars, row->size);
             prev_row->size += row->size;
             prev_row->chars[prev_row->size] = '\0';
-            row_update(prev_row, ec.cursor_y - 1);
+            row_update(prev_row);
             row_erase(ec.cursor_y);
             ec.cursor_y--;
             ec.modified = true;
@@ -2578,7 +2577,7 @@ static bool do_replace_one(const char *replacement, size_t repl_len)
         memcpy(&row->chars[off], replacement, repl_len);
     row->size = (int)new_size;
     row->chars[row->size] = '\0';
-    row_update(row, g_last_match.row);
+    row_update(row);
     ec.modified = true;
     undo_record_replace(g_last_match.row, off, old_text, (size_t)oldlen,
                         replacement, repl_len,
