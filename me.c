@@ -38,6 +38,8 @@
 
 #include <time.h>
 
+#include "tree_sitter/api.h"
+
 /* Search mode flags (bitmask) */
 typedef enum {
     SM_NONE           = 0,
@@ -396,18 +398,12 @@ typedef struct {
     bool hl_valid;
 } editor_row_t;
 
-/* One entry in a keyword table.  len is a compile-time sizeof(literal)-1 so
- * the highlight loop never calls strlen(). */
-typedef struct { const char *str; int len; unsigned char type; } keyword_t;
-
 /* Syntax highlighting structure */
 typedef struct {
     char *file_type;
     char **file_match;
-    const keyword_t *keywords;
-    char *sl_comment_start;                  /* single line */
-    char *ml_comment_start, *ml_comment_end; /* multiple lines */
-    int flags;
+    const TSLanguage *(*tree_sitter_language)(void);
+    const char *highlight_query;
 } editor_syntax_t;
 
 /* X-macro for editor modes */
@@ -641,42 +637,37 @@ typedef enum {
 } highlight_type_t;
 /* clang-format on */
 
-#define HIGHLIGHT_NUMBERS (1 << 0)
-#define HIGHLIGHT_STRINGS (1 << 1)
-
 char *C_extensions[] = {".c", ".cc", ".cxx", ".cpp", ".h", NULL};
 
-/* Macros to build keyword table entries with compile-time lengths. */
-#define KW1(s) { s, sizeof(s)-1, KEYWORD_1 }
-#define KW2(s) { s, sizeof(s)-1, KEYWORD_2 }
-#define KW3(s) { s, sizeof(s)-1, KEYWORD_3 }
+const TSLanguage *tree_sitter_c(void);
 
-keyword_t C_keywords[] = {
-    KW1("switch"),   KW1("if"),       KW1("while"),    KW1("for"),      KW1("break"),
-    KW1("continue"), KW1("return"),   KW1("else"),     KW1("struct"),   KW1("union"),
-    KW1("typedef"),  KW1("static"),   KW1("enum"),     KW1("class"),    KW1("case"),
-    KW1("volatile"), KW1("register"), KW1("sizeof"),   KW1("goto"),     KW1("const"),
-    KW1("auto"),
-    KW3("#if"),      KW3("#endif"),   KW3("#error"),   KW3("#ifdef"),   KW3("#ifndef"),
-    KW3("#elif"),    KW3("#define"),  KW3("#undef"),   KW3("#include"),
-    KW2("int"),      KW2("long"),     KW2("double"),   KW2("float"),    KW2("char"),
-    KW2("unsigned"), KW2("signed"),   KW2("void"),     KW2("bool"),
-    { NULL, 0, 0 },
-};
-
-#undef KW1
-#undef KW2
-#undef KW3
+/* Mirror of vendored tree-sitter-c/queries/highlights.scm captures that we map
+ * onto Mazu's existing highlight colors. To add another language, vendor its
+ * parser and query, add a DB entry, and extend syntax_capture_to_highlight(). */
+static const char C_highlight_query[] =
+    "(comment) @comment\n"
+    "(string_literal) @string\n"
+    "(system_lib_string) @string\n"
+    "[(number_literal) (char_literal)] @number\n"
+    "[(primitive_type) (type_identifier) (sized_type_specifier)] @type\n"
+    "[\n"
+    "  \"break\" \"case\" \"const\" \"continue\" \"default\"\n"
+    "  \"do\" \"else\" \"enum\" \"extern\" \"for\" \"if\" \"inline\"\n"
+    "  \"return\" \"sizeof\" \"static\" \"struct\" \"switch\" \"typedef\"\n"
+    "  \"union\" \"volatile\" \"while\"\n"
+    "] @keyword\n"
+    "[\n"
+    "  \"#define\" \"#elif\" \"#else\" \"#endif\"\n"
+    "  \"#if\" \"#ifdef\" \"#ifndef\" \"#include\"\n"
+    "] @preproc\n"
+    "(preproc_directive) @preproc\n";
 
 editor_syntax_t DB[] = {
     {
         "c",
         C_extensions,
-        C_keywords,
-        "//",
-        "/*",
-        "*/",
-        HIGHLIGHT_NUMBERS | HIGHLIGHT_STRINGS,
+        tree_sitter_c,
+        C_highlight_query,
     },
 };
 
@@ -685,6 +676,7 @@ editor_syntax_t DB[] = {
 static char *ui_prompt(const char *msg, void (*callback)(char *, int));
 static void editor_refresh(void);
 static int get_line_number_width(void);
+static int row_cursorx_to_renderx(editor_row_t *row, int cursor_x);
 static void editor_newline(void);
 static void editor_insert_char(int c, bool manual_typing);
 static void undo_record_insert(int row, int col, const char *text, size_t len,
@@ -985,118 +977,271 @@ static void term_close_buffer(void)
     term_clear();
 }
 
-static bool syntax_is_separator(int c)
+typedef struct {
+    TSParser *parser;
+    TSQuery *query;
+    TSQueryCursor *cursor;
+    const editor_syntax_t *active_syntax;
+} tree_sitter_state_t;
+
+static tree_sitter_state_t g_tree_sitter = {0};
+
+static bool syntax_prepare_row_highlight(editor_row_t *row)
 {
-    return isspace(c) || !c || strchr(",.()+-/*=~%<>[]:;", c);
+    if (row->render_size <= 0) {
+        free(row->highlight);
+        row->highlight = NULL;
+        row->hl_open_comment = false;
+        row->hl_valid = true;
+        return true;
+    }
+    unsigned char *highlight =
+        realloc(row->highlight, (size_t) row->render_size);
+    if (!highlight)
+        return false;
+    row->highlight = highlight;
+    memset(row->highlight, NORMAL, (size_t) row->render_size);
+    row->hl_open_comment = false;
+    row->hl_valid = true;
+    return true;
 }
 
-static bool syntax_is_number_part(int c)
+static bool syntax_prepare_all_rows(void)
 {
-    return c == '.' || c == 'x' || c == 'a' || c == 'b' || c == 'c' ||
-           c == 'd' || c == 'e' || c == 'f' || c == 'A' || c == 'X' ||
-           c == 'B' || c == 'C' || c == 'D' || c == 'E' || c == 'F' ||
-           c == 'h' || c == 'H';
+    for (int i = 0; i < NR; i++) {
+        if (!syntax_prepare_row_highlight(ROW(i))) {
+            ui_set_message("Memory allocation failed");
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool syntax_build_source(char **source_out, size_t **row_offsets_out,
+                                size_t *source_len_out)
+{
+    size_t *row_offsets = malloc((size_t) (NR + 1) * sizeof(*row_offsets));
+    if (!row_offsets)
+        return false;
+
+    size_t total_len = 0;
+    for (int i = 0; i < NR; i++) {
+        editor_row_t *row = ROW(i);
+        total_len += (size_t) row->size;
+        if (i + 1 < NR)
+            total_len++;
+    }
+
+    char *source = malloc(total_len + 1);
+    if (!source) {
+        free(row_offsets);
+        return false;
+    }
+
+    size_t pos = 0;
+    for (int i = 0; i < NR; i++) {
+        editor_row_t *row = ROW(i);
+        row_offsets[i] = pos;
+        if (row->size > 0) {
+            memcpy(&source[pos], row->chars, (size_t) row->size);
+            pos += (size_t) row->size;
+        }
+        if (i + 1 < NR)
+            source[pos++] = '\n';
+    }
+    row_offsets[NR] = pos;
+    source[pos] = '\0';
+
+    *source_out = source;
+    *row_offsets_out = row_offsets;
+    *source_len_out = pos;
+    return true;
+}
+
+static int syntax_row_for_byte(const size_t *row_offsets, size_t byte)
+{
+    if (NR <= 0)
+        return -1;
+    int lo = 0, hi = NR - 1;
+    while (lo <= hi) {
+        int mid = lo + ((hi - lo) / 2);
+        if (byte < row_offsets[mid]) {
+            hi = mid - 1;
+        } else if (byte >= row_offsets[mid + 1]) {
+            lo = mid + 1;
+        } else {
+            return mid;
+        }
+    }
+    return NR - 1;
+}
+
+static int syntax_highlight_priority(unsigned char hl)
+{
+    switch (hl) {
+    case NORMAL:
+        return 0;
+    case KEYWORD_1:
+    case KEYWORD_2:
+    case KEYWORD_3:
+        return 1;
+    case NUMBER:
+        return 2;
+    case STRING:
+        return 3;
+    case SL_COMMENT:
+    case ML_COMMENT:
+        return 4;
+    default:
+        return 5;
+    }
+}
+
+static unsigned char syntax_capture_to_highlight(const char *capture,
+                                                 uint32_t capture_len)
+{
+    if (capture_len == 7 && !strncmp(capture, "comment", capture_len))
+        return ML_COMMENT;
+    if (capture_len == 6 && !strncmp(capture, "string", capture_len))
+        return STRING;
+    if (capture_len == 6 && !strncmp(capture, "number", capture_len))
+        return NUMBER;
+    if (capture_len == 4 && !strncmp(capture, "type", capture_len))
+        return KEYWORD_2;
+    if (capture_len == 7 && !strncmp(capture, "keyword", capture_len))
+        return KEYWORD_1;
+    if (capture_len == 7 && !strncmp(capture, "preproc", capture_len))
+        return KEYWORD_3;
+    return NORMAL;
+}
+
+static void syntax_apply_capture_range(const size_t *row_offsets, uint32_t start,
+                                       uint32_t end, unsigned char hl)
+{
+    if (hl == NORMAL || start >= end || NR <= 0)
+        return;
+
+    int row_idx = syntax_row_for_byte(row_offsets, start);
+    if (row_idx < 0)
+        return;
+
+    while (row_idx < NR && row_offsets[row_idx] < end) {
+        editor_row_t *row = ROW(row_idx);
+        size_t row_start = row_offsets[row_idx];
+        size_t row_end = row_start + (size_t) row->size;
+        size_t range_start = start > row_start ? (size_t) start : row_start;
+        size_t range_end = end < row_end ? (size_t) end : row_end;
+        if (range_start < range_end && row->highlight) {
+            int byte_start = (int) (range_start - row_start);
+            int byte_end = (int) (range_end - row_start);
+            int render_start = row_cursorx_to_renderx(row, byte_start);
+            int render_end = row_cursorx_to_renderx(row, byte_end);
+            if (render_start < 0)
+                render_start = 0;
+            if (render_end > row->render_size)
+                render_end = row->render_size;
+            for (int i = render_start; i < render_end; i++) {
+                if (syntax_highlight_priority(hl) >=
+                    syntax_highlight_priority(row->highlight[i]))
+                    row->highlight[i] = hl;
+            }
+        }
+        row_idx++;
+    }
+}
+
+static bool syntax_tree_sitter_prepare(void)
+{
+    if (!ec.syntax)
+        return false;
+
+    if (!g_tree_sitter.parser)
+        g_tree_sitter.parser = ts_parser_new();
+    if (!g_tree_sitter.cursor)
+        g_tree_sitter.cursor = ts_query_cursor_new();
+    if (!g_tree_sitter.parser || !g_tree_sitter.cursor) {
+        ui_set_message("Tree-sitter initialization failed");
+        return false;
+    }
+
+    if (g_tree_sitter.active_syntax != ec.syntax) {
+        if (g_tree_sitter.query) {
+            ts_query_delete(g_tree_sitter.query);
+            g_tree_sitter.query = NULL;
+        }
+        const TSLanguage *lang = ec.syntax->tree_sitter_language();
+        if (!lang || !ts_parser_set_language(g_tree_sitter.parser, lang)) {
+            ui_set_message("Tree-sitter language setup failed");
+            return false;
+        }
+        uint32_t error_offset = 0;
+        TSQueryError error_type = TSQueryErrorNone;
+        g_tree_sitter.query = ts_query_new(lang, ec.syntax->highlight_query,
+                                           strlen(ec.syntax->highlight_query),
+                                           &error_offset, &error_type);
+        (void) error_type;
+        if (!g_tree_sitter.query) {
+            ui_set_message("Tree-sitter query error at byte %u", error_offset);
+            return false;
+        }
+        g_tree_sitter.active_syntax = ec.syntax;
+    }
+
+    return true;
 }
 
 static void syntax_highlight(editor_row_t *row, int row_idx)
 {
-    row->highlight = realloc(row->highlight, row->render_size);
-    memset(row->highlight, NORMAL, row->render_size);
-    if (!ec.syntax)
+    (void) row;
+    (void) row_idx;
+
+    if (!syntax_prepare_all_rows())
         return;
-    const keyword_t *keywords = ec.syntax->keywords;
-    char *scs = ec.syntax->sl_comment_start;
-    char *mcs = ec.syntax->ml_comment_start;
-    char *mce = ec.syntax->ml_comment_end;
-    int scs_len = scs ? strlen(scs) : 0;
-    int mcs_len = mcs ? strlen(mcs) : 0;
-    int mce_len = mce ? strlen(mce) : 0;
-    bool prev_sep = true;
-    int in_string = 0;
-    bool in_comment = (row_idx > 0 && ROW(row_idx - 1)->hl_open_comment);
-    int i = 0;
-    while (i < row->render_size) {
-        char c = row->render[i];
-        unsigned char prev_highlight = (i > 0) ? row->highlight[i - 1] : NORMAL;
-        if (scs_len && !in_string && !in_comment) {
-            if (!strncmp(&row->render[i], scs, scs_len)) {
-                memset(&row->highlight[i], SL_COMMENT, row->render_size - i);
-                break;
-            }
-        }
-        if (mcs_len && mce_len && !in_string) {
-            if (in_comment) {
-                row->highlight[i] = ML_COMMENT;
-                if (!strncmp(&row->render[i], mce, mce_len)) {
-                    memset(&row->highlight[i], ML_COMMENT, mce_len);
-                    i += mce_len;
-                    in_comment = 0;
-                    prev_sep = true;
-                    continue;
-                } else {
-                    i++;
-                    continue;
-                }
-            } else if (!strncmp(&row->render[i], mcs, mcs_len)) {
-                memset(&row->highlight[i], ML_COMMENT, mcs_len);
-                i += mcs_len;
-                in_comment = 1;
-                continue;
-            }
-        }
-        if (ec.syntax->flags & HIGHLIGHT_STRINGS) {
-            if (in_string) {
-                row->highlight[i] = STRING;
-                if ((c == '\\') && (i + 1 < row->render_size)) {
-                    row->highlight[i + 1] = STRING;
-                    i += 2;
-                    continue;
-                }
-                if (c == in_string)
-                    in_string = 0;
-                i++;
-                prev_sep = true;
-                continue;
-            } else {
-                if ((c == '"') || (c == '\'')) {
-                    in_string = c;
-                    row->highlight[i] = STRING;
-                    i++;
-                    continue;
-                }
-            }
-        }
-        if (ec.syntax->flags & HIGHLIGHT_NUMBERS) {
-            if ((isdigit(c) && (prev_sep || (prev_highlight == NUMBER))) ||
-                (syntax_is_number_part(c) && (prev_highlight == NUMBER))) {
-                row->highlight[i] = NUMBER;
-                i++;
-                prev_sep = false;
-                continue;
-            }
-        }
-        if (prev_sep) {
-            const keyword_t *kw;
-            for (kw = keywords; kw->str; kw++) {
-                if (!strncmp(&row->render[i], kw->str, kw->len) &&
-                    syntax_is_separator(row->render[i + kw->len])) {
-                    memset(&row->highlight[i], kw->type, kw->len);
-                    i += kw->len;
-                    break;
-                }
-            }
-            if (kw->str) {
-                prev_sep = false;
-                continue;
-            }
-        }
-        prev_sep = syntax_is_separator(c);
-        i++;
+    if (!ec.syntax || NR <= 0)
+        return;
+    if (!syntax_tree_sitter_prepare())
+        return;
+
+    char *source = NULL;
+    size_t *row_offsets = NULL;
+    size_t source_len = 0;
+    if (!syntax_build_source(&source, &row_offsets, &source_len)) {
+        ui_set_message("Memory allocation failed");
+        return;
     }
-    bool changed = (row->hl_open_comment != in_comment);
-    row->hl_open_comment = in_comment;
-    if (changed && row_idx + 1 < NR)
-        syntax_highlight(ROW(row_idx + 1), row_idx + 1);
+
+    TSTree *tree = ts_parser_parse_string(g_tree_sitter.parser, NULL, source,
+                                          (uint32_t) source_len);
+    if (!tree) {
+        free(source);
+        free(row_offsets);
+        ui_set_message("Tree-sitter parse failed");
+        return;
+    }
+
+    ts_query_cursor_exec(g_tree_sitter.cursor, g_tree_sitter.query,
+                         ts_tree_root_node(tree));
+
+    TSQueryMatch match;
+    while (ts_query_cursor_next_match(g_tree_sitter.cursor, &match)) {
+        for (uint16_t i = 0; i < match.capture_count; i++) {
+            TSQueryCapture capture = match.captures[i];
+            uint32_t cap_len = 0;
+            const char *cap_name =
+                ts_query_capture_name_for_id(g_tree_sitter.query, capture.index,
+                                             &cap_len);
+            unsigned char hl = syntax_capture_to_highlight(cap_name, cap_len);
+            if (hl == NORMAL)
+                continue;
+            uint32_t start = ts_node_start_byte(capture.node);
+            uint32_t end = ts_node_end_byte(capture.node);
+            syntax_apply_capture_range(row_offsets, start, end, hl);
+        }
+    }
+
+    ts_tree_delete(tree);
+    free(source);
+    free(row_offsets);
 }
 
 /* Reference: https://misc.flogisoft.com/bash/tip_colors_and_formatting */
@@ -1128,12 +1273,12 @@ static void syntax_select(void)
             int pat_len = strlen(es->file_match[i]);
             if ((es->file_match[i][0] != '.') || (p[pat_len] == '\0')) {
                 ec.syntax = es;
-                for (int file_row = 0; file_row < NR; file_row++)
-                    syntax_highlight(ROW(file_row), file_row);
+                syntax_highlight(NULL, 0);
                 return;
             }
         }
     }
+    syntax_highlight(NULL, 0);
 }
 
 static int row_cursorx_to_renderx(editor_row_t *row, int cursor_x)
