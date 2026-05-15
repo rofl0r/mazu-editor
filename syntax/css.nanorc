@@ -1,0 +1,29 @@
+syntax "css" "\.s?css$"
+
+# Selectors
+color red "[>+~*]"
+color brightyellow "[.#][A-Za-z_][A-Za-z0-9_-]*"
+color red ":(active|focus|hover|link|visited|first-child|lang|valid|invalid|not|selection)\>"
+color red ":(after|before|first-line|first-letter|root|target)\>"
+color yellow   "\[[^\[]*\]"
+color black    start="\{" end="\}"
+
+# Sass
+color brightmagenta  "(^|[[:space:]])@(include|mixin)\>"
+color brightyellow "\$[A-Za-z0-9_-]+"
+
+color brightmagenta  "(^|[[:space:]])@(charset|font-face|media|page|import)\>"
+color brightyellow ":[[:space:]]*(code|hidden|table|pre)\>"
+color black    "[:;,]"
+color blue   "\<(0|[\+-]?[1-9][0-9]*)"
+color blue   "[\+-]?([0-9]+|[0-9]*\.[0-9]+)(%|e(m|x)|p(x|t|c)|in|ft|(m|c)m|k?Hz|deg|g?rad|m?s)"
+color blue   "#([a-fA-F0-9]{6}|[a-fA-F0-9]{3})\>"
+color red "\!important\>"
+color brightblue "[a-z-]*(-[a-z]+)?\(" "\(|\)"
+color yellow ""(\\.|[^"])*"|'(\\.|[^'])*'"
+color cyan "(^|[[:space:]])//.*"
+color cyan start="/\*" end="\*/"
+color brightwhite,cyan "TODO:?"
+color ,green "[[:space:]]+$"
+color ,red "	+ +| +	+"
+# +EXTRALINT

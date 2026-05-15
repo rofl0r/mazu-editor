@@ -30,7 +30,6 @@ Supported keys:
     - Ctrl-R: Toggle replace mode
 * Ctrl-K: Cut current line (consecutive Ctrl-K appends to cut buffer)
 * Ctrl-U: Paste/uncut
-* Ctrl-N: Toggle line numbers display
 * Ctrl-G: Show help screen
 * M-A: Set/toggle mark (text selection)
     - Move cursor to select text while marking
@@ -43,11 +42,17 @@ Supported keys:
     - ESC or Ctrl-X to cancel
 * M-G: Go to line number
     - Type line number, Enter to jump, ESC to cancel
+* M-]: Go to matching bracket
 * M-\\: Go to first line of file
 * M-/: Go to last line of file
+* M-#: Toggle line numbers display
+* M-P: Toggle whitespace/tab marker display
+* M-Y: Toggle syntax highlighting
 * PageUp, PageDown: Scroll up/down
 * Up/Down/Left/Right: Move cursor
 * Home/End: move cursor to the beginning/end of editing line
+
+Syntax highlighting is auto-disabled for recognized files larger than 16 MiB.
 
 CULO Editor does not depend on external library (not even curses).
 It uses fairly standard VT100 (and similar terminals) escape sequences.

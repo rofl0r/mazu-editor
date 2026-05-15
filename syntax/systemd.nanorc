@@ -1,0 +1,11 @@
+syntax "systemd" "\.(service|socket|mount|slice|target|timer|path)$"
+header "^\[Unit\]$"
+
+color brightblue "^\.include\>"
+color red "="
+color brightmagenta  "^\[(Unit|Install|Service|Socket|Mount|Timer|Path)\]"
+color cyan "(^|[[:space:]])#([^{].*)?$"
+color ,green "[[:space:]]+$"
+color ,red "	+ +| +	+"
+# +EXTRALINT
+

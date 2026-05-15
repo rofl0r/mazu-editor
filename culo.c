@@ -27,6 +27,7 @@
 #include <termios.h>
 #include <unistd.h>
 #include "nregex.h"
+#include "syntax.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -46,7 +47,9 @@ typedef enum {
 #define CTRL_(k) ((k) & (0x1f))
 #define META_(k) (0x800 | (unsigned char)(k))
 #define TAB_STOP 4
+#define TAB_HEAD_STYLE "\x1b[90m"
 #define UNDO_STACK_CAP 64
+#define SYNTAX_AUTO_DISABLE_THRESHOLD (16u * 1024u * 1024u)
 
 /* UTF-8 handling functions */
 
@@ -379,6 +382,19 @@ static int tlist_insert(struct tlist *t, size_t idx, void *value)
 	return 1;
 }
 
+static int tlist_insert_sorted(struct tlist *t, void *value,
+			       int (*cmp)(const void *, const void *))
+{
+	size_t n = tlist_getsize(t);
+	size_t i;
+	for (i = 0; i < n; i++) {
+		void *cur = tlist_get(t, i);
+		if (cmp(value, cur) < 0)
+			break;
+	}
+	return tlist_insert(t, i, value);
+}
+
 TLIST_INTERNAL int tlist_delete_impl(struct tlist *t, size_t idx)
 {
 	if (idx >= tlist_cnt(t->root))
@@ -416,27 +432,10 @@ typedef struct {
 	char *render;
 	unsigned char *highlight;
 	bool render_direct_map;
-	bool hl_open_comment;
 	bool hl_valid;
+	bool span_open;
+	int span_rule;
 } editor_row_t;
-
-/* One entry in a keyword table.  len is a compile-time sizeof(literal)-1 so
- * the highlight loop never calls strlen(). */
-typedef struct {
-	const char *str;
-	int len;
-	unsigned char type;
-} keyword_t;
-
-/* Syntax highlighting structure */
-typedef struct {
-	char *file_type;
-	char **file_match;
-	const keyword_t *keywords;
-	char *sl_comment_start;	/* single line */
-	char *ml_comment_start, *ml_comment_end;	/* multiple lines */
-	int flags;
-} editor_syntax_t;
 
 /* X-macro for editor modes */
 #define EDITOR_MODES                                  \
@@ -473,6 +472,11 @@ typedef struct {
 	bool active;		/* Is selection active? */
 } selection_state_t;
 
+typedef struct {
+	char name[NAME_MAX + 1];
+	bool is_dir;
+} browser_entry_t;
+
 /* Mode-specific state data */
 typedef union {
 	struct {
@@ -484,17 +488,30 @@ typedef union {
 		char *buffer;
 	} prompt;
 	struct {
-		char **entries;	/* Array of file/dir names */
-		int num_entries;	/* Number of entries */
+		tlist *entries;	/* Browser entries */
 		int selected;	/* Currently selected entry */
 		int offset;	/* Scroll offset */
-		char *current_dir;	/* Current directory path */
+		char current_dir[PATH_MAX];	/* Current directory path */
 		bool show_hidden;	/* Show hidden files (toggle with H) */
 	} browser;
 	struct {
 		int offset;	/* Scroll offset (lines from top) */
 	} help;
 } mode_data_t;
+
+typedef struct {
+	regex_t compiled;
+	bool valid;
+	unsigned char hl_code;
+} compiled_rule_t;
+
+typedef struct {
+	regex_t start_compiled;
+	regex_t end_compiled;
+	bool valid_start;
+	bool valid_end;
+	unsigned char hl_code;
+} compiled_span_rule_t;
 
 /* Editor config structure */
 struct {
@@ -507,7 +524,17 @@ struct {
 	char status_msg[512];
 	time_t status_msg_time;
 	char *copied_char_buffer;
-	editor_syntax_t *syntax;
+	size_t file_size_bytes;
+	const struct syntax_desc *syntax;
+	compiled_rule_t *syntax_compiled;
+	size_t syntax_compiled_count;
+	compiled_span_rule_t *syntax_span_compiled;
+	size_t syntax_span_compiled_count;
+	struct {
+		color_id_t fg;
+		color_id_t bg;
+	} syntax_palette[256];
+	unsigned char syntax_palette_count;
 	struct termios orig_termios;
 	/* Editor mode state machine */
 	editor_mode_t mode;
@@ -515,6 +542,7 @@ struct {
 	mode_data_t mode_state;	/* Mode-specific state data */
 	selection_state_t selection;	/* Text selection state */
 	bool show_line_numbers;	/* Toggle line numbers display */
+	bool show_whitespace;	/* Toggle tab/whitespace markers */
 	bool last_was_cut;	/* True if previous key was ^K (for appending cuts) */
 	struct {
 		char *query;	/* Persists across ^W invocations; NULL until first search */
@@ -530,23 +558,20 @@ struct {
 		bool has_wrapped;	/* true once any search_do_from call in this session returned wrapped=true */
 	} search;
 	char notfound_msg[200];	/* transient "not found" overlay; cleared on next keypress */
-} ec = {
-	.cursor_x = 0,.cursor_y = 0,.render_x = 0,.row_offset = 0,.col_offset =
-	    0,.rows = NULL,.modified = false,.file_name = NULL,.status_msg =
-	    "",.status_msg_time = 0,.copied_char_buffer = NULL,.syntax =
-	    NULL,.mode = MODE_NORMAL,.prev_mode = MODE_NORMAL,.mode_state = { {
-	0}},.selection = {
-	.start_x = 0,.start_y = 0,.end_x = 0,.end_y = 0,.active =
-		    false,},.show_line_numbers = false,.last_was_cut =
-	    false,.search = {
-		.query = NULL,.query_len = 0,.query_cap = 0,.mode =
-		    SM_NONE,.replace_query = NULL,.replace_len =
-		    0,.replace_cap = 0,
-		    /* orig_row=-1 means "no active replace cycle"; orig_char is only
-		     * meaningful when orig_row >= 0, so 0 is a fine default. */
-.replace_phase = 0,.replace_count = 0,.orig_row =
-		    -1,.orig_char = 0,.has_wrapped =
-		    false},.notfound_msg = "",};
+	char browser_base_dir[PATH_MAX];
+} ec;
+
+static void init_ec(void)
+{
+	memset(&ec, 0, sizeof(ec));
+	ec.mode = MODE_NORMAL;
+	ec.prev_mode = MODE_NORMAL;
+	ec.show_whitespace = true;
+	snprintf(ec.browser_base_dir, sizeof(ec.browser_base_dir), ".");
+	/* orig_row=-1 means "no active replace cycle"; orig_char is only
+	 * meaningful when orig_row >= 0, so 0 is a fine default. */
+	ec.search.orig_row = -1;
+}
 
 typedef enum {
 	EDIT_INSERT = 0,
@@ -631,69 +656,18 @@ enum editor_key {
 	HOME_KEY, END_KEY, DEL_KEY,
 };
 
-/* X-macro for syntax highlighting types */
-#define HIGHLIGHT_TYPES                         \
-    _(NORMAL, 97, "Default text")               \
-    _(MATCH, 43, "Search match")                \
-    _(SL_COMMENT, 36, "Single-line comment")    \
-    _(ML_COMMENT, 36, "Multi-line comment")     \
-    _(KEYWORD_1, 93, "Primary keyword")         \
-    _(KEYWORD_2, 92, "Secondary keyword")       \
-    _(KEYWORD_3, 36, "Preprocessor")            \
-    _(STRING, 91, "String literal")             \
-    _(NUMBER, 31, "Numeric literal")
-
-/* Generate highlight enum using X-macro */
 typedef enum {
-#define _(type, color, desc) type,
-	HIGHLIGHT_TYPES
-#undef _
-	HIGHLIGHT_COUNT
+	NORMAL = 0,
+	MATCH = 1,
+	HIGHLIGHT_DYNAMIC_BASE = 2
 } highlight_type_t;
 /* clang-format on */
 
-#define HIGHLIGHT_NUMBERS (1 << 0)
-#define HIGHLIGHT_STRINGS (1 << 1)
-
-char *C_extensions[] = { ".c", ".cc", ".cxx", ".cpp", ".h", NULL };
-
-/* Macros to build keyword table entries with compile-time lengths. */
-#define KW1(s) { s, sizeof(s)-1, KEYWORD_1 }
-#define KW2(s) { s, sizeof(s)-1, KEYWORD_2 }
-#define KW3(s) { s, sizeof(s)-1, KEYWORD_3 }
-
-keyword_t C_keywords[] = {
-	KW1("switch"), KW1("if"), KW1("while"), KW1("for"), KW1("break"),
-	KW1("continue"), KW1("return"), KW1("else"), KW1("struct"),
-	    KW1("union"),
-	KW1("typedef"), KW1("static"), KW1("enum"), KW1("class"), KW1("case"),
-	KW1("volatile"), KW1("register"), KW1("sizeof"), KW1("goto"),
-	    KW1("const"),
-	KW1("auto"),
-	KW3("#if"), KW3("#endif"), KW3("#error"), KW3("#ifdef"), KW3("#ifndef"),
-	KW3("#elif"), KW3("#define"), KW3("#undef"), KW3("#include"),
-	KW2("int"), KW2("long"), KW2("double"), KW2("float"), KW2("char"),
-	KW2("unsigned"), KW2("signed"), KW2("void"), KW2("bool"),
-	{NULL, 0, 0},
+const struct syntax_desc syntax_rules[] = {
+#include "nanorc.h"
+	/* terminating sentinel */
+	{.file_regex = NULL, .rule_count = 0, .rules = NULL}
 };
-
-#undef KW1
-#undef KW2
-#undef KW3
-
-editor_syntax_t DB[] = {
-	{
-	 "c",
-	 C_extensions,
-	 C_keywords,
-	 "//",
-	 "/*",
-	 "*/",
-	 HIGHLIGHT_NUMBERS | HIGHLIGHT_STRINGS,
-	 },
-};
-
-#define DB_ENTRIES (sizeof(DB) / sizeof(DB[0]))
 
 static char *ui_prompt(const char *prefix, const char *hint, const char *init, void (*callback) (char *, int));
 static void editor_refresh(void);
@@ -848,9 +822,12 @@ static const char *const help_lines[] = {
 	"  M-\\     Go to first line of file",
 	"  M-/     Go to last line of file",
 	"  M-G     Go to line number",
+	"  M-]     Go to matching bracket",
 	"",
 	"View:",
-	"  ^N      Toggle line numbers",
+	"  M-#     Toggle line numbers",
+	"  M-P     Toggle whitespace display",
+	"  M-Y     Toggle syntax highlighting",
 	"  ^G      Show this help screen",
 	"",
 };
@@ -1004,165 +981,386 @@ static void term_close_buffer(void)
 	term_clear();
 }
 
-static bool syntax_is_separator(int c)
+static int color_id_to_ansi_fg_code(color_id_t id)
 {
-	return isspace(c) || !c || strchr(",.()+-/*=~%<>[]:;", c);
+	if (id == COLOR_NONE)
+		return 39;
+	if (id >= COLOR_BLACK && id <= COLOR_WHITE)
+		return 30 + (int) id;
+	if (id >= COLOR_BRIGHTBLACK && id <= COLOR_BRIGHTWHITE)
+		return 90 + ((int) id - (int) COLOR_BRIGHTBLACK);
+	return 39;
 }
 
-static bool syntax_is_number_part(int c)
+static int color_id_to_ansi_bg_code(color_id_t id)
 {
-	return c == '.' || c == 'x' || c == 'a' || c == 'b' || c == 'c' ||
-	    c == 'd' || c == 'e' || c == 'f' || c == 'A' || c == 'X' ||
-	    c == 'B' || c == 'C' || c == 'D' || c == 'E' || c == 'F' ||
-	    c == 'h' || c == 'H';
+	if (id == COLOR_NONE)
+		return 49;
+	if (id >= COLOR_BLACK && id <= COLOR_WHITE)
+		return 40 + (int) id;
+	if (id >= COLOR_BRIGHTBLACK && id <= COLOR_BRIGHTWHITE)
+		return 100 + ((int) id - (int) COLOR_BRIGHTBLACK);
+	return 49;
 }
 
-static void syntax_highlight(editor_row_t * row, int row_idx)
+static int syntax_style_escape(unsigned char highlight, char *buf, size_t buflen)
+{
+	if (highlight == MATCH)
+		return snprintf(buf, buflen, "\x1b[43m");
+	if (highlight >= HIGHLIGHT_DYNAMIC_BASE &&
+	    highlight < ec.syntax_palette_count) {
+		color_id_t fg = ec.syntax_palette[highlight].fg;
+		color_id_t bg = ec.syntax_palette[highlight].bg;
+		return snprintf(buf, buflen, "\x1b[%d;%dm",
+				color_id_to_ansi_fg_code(fg),
+				color_id_to_ansi_bg_code(bg));
+	}
+	return snprintf(buf, buflen, "\x1b[39;49m");
+}
+
+static unsigned char syntax_palette_code(color_id_t fg, color_id_t bg)
+{
+	for (unsigned char i = HIGHLIGHT_DYNAMIC_BASE;
+	     i < ec.syntax_palette_count; i++) {
+		if (ec.syntax_palette[i].fg == fg && ec.syntax_palette[i].bg == bg)
+			return i;
+	}
+	if (ec.syntax_palette_count == 255)
+		return NORMAL;
+	ec.syntax_palette[ec.syntax_palette_count].fg = fg;
+	ec.syntax_palette[ec.syntax_palette_count].bg = bg;
+	return ec.syntax_palette_count++;
+}
+
+static void syntax_reset_compiled_rules(void)
+{
+	for (size_t i = 0; i < ec.syntax_compiled_count; i++) {
+		if (ec.syntax_compiled[i].valid)
+			regfree(&ec.syntax_compiled[i].compiled);
+	}
+	free(ec.syntax_compiled);
+	ec.syntax_compiled = NULL;
+	ec.syntax_compiled_count = 0;
+	for (size_t i = 0; i < ec.syntax_span_compiled_count; i++) {
+		if (ec.syntax_span_compiled[i].valid_start)
+			regfree(&ec.syntax_span_compiled[i].start_compiled);
+		if (ec.syntax_span_compiled[i].valid_end)
+			regfree(&ec.syntax_span_compiled[i].end_compiled);
+	}
+	free(ec.syntax_span_compiled);
+	ec.syntax_span_compiled = NULL;
+	ec.syntax_span_compiled_count = 0;
+	ec.syntax_palette_count = HIGHLIGHT_DYNAMIC_BASE;
+}
+
+static void syntax_invalidate_all_rows(void)
+{
+	for (int file_row = 0; file_row < NR; file_row++)
+		ROW(file_row)->hl_valid = false;
+}
+
+static void syntax_disable(bool announce)
+{
+	syntax_reset_compiled_rules();
+	ec.syntax = NULL;
+	syntax_invalidate_all_rows();
+	if (announce)
+		ui_set_message("Syntax highlighting disabled");
+}
+
+static void syntax_apply_rules(editor_row_t *row)
+{
+	for (size_t r = 0; r < ec.syntax_compiled_count; r++) {
+		size_t offset = 0;
+		regmatch_t match;
+		while (offset <= (size_t) row->render_size) {
+			int rc = regexec(&ec.syntax_compiled[r].compiled,
+					 row->render + offset, 1, &match,
+					 (offset == 0) ? 0 : REG_NOTBOL);
+			size_t from, to;
+			if (rc != 0 || match.rm_so < 0 || match.rm_eo < 0)
+				break;
+			from = offset + (size_t) match.rm_so;
+			to = offset + (size_t) match.rm_eo;
+			if (from > (size_t) row->render_size)
+				break;
+			if (to > (size_t) row->render_size)
+				to = (size_t) row->render_size;
+			if (to > from) {
+				for (size_t i = from; i < to; i++)
+					if (row->highlight[i] == NORMAL)
+						row->highlight[i] =
+						    ec.syntax_compiled[r].hl_code;
+			}
+			if (to <= offset) {
+				if (offset == (size_t) row->render_size)
+					break;
+				offset++;
+			} else {
+				offset = to;
+			}
+		}
+	}
+}
+
+static void syntax_fill_range(editor_row_t *row, size_t from, size_t to,
+			      unsigned char hl_code, bool only_normal)
+{
+	if (from > (size_t) row->render_size)
+		return;
+	if (to > (size_t) row->render_size)
+		to = (size_t) row->render_size;
+	if (to <= from)
+		return;
+	if (!only_normal) {
+		memset(row->highlight + from, hl_code, to - from);
+		return;
+	}
+	for (size_t i = from; i < to; i++)
+		if (row->highlight[i] == NORMAL)
+			row->highlight[i] = hl_code;
+}
+
+static bool syntax_find_match(regex_t *rx, const char *s, size_t offset,
+			      size_t * out_from, size_t * out_to)
+{
+	regmatch_t m;
+	int rc = regexec(rx, s + offset, 1, &m, (offset == 0) ? 0 : REG_NOTBOL);
+	if (rc != 0 || m.rm_so < 0 || m.rm_eo < 0)
+		return false;
+	*out_from = offset + (size_t) m.rm_so;
+	*out_to = offset + (size_t) m.rm_eo;
+	return *out_to > *out_from;
+}
+
+static void syntax_apply_span_rules(editor_row_t *row, int row_idx)
+{
+	size_t pos = 0;
+	bool in_span = false;
+	int active_span = -1;
+	size_t len = (size_t) row->render_size;
+
+	row->span_open = false;
+	row->span_rule = -1;
+	if (ec.syntax_span_compiled_count == 0)
+		return;
+
+	if (row_idx > 0 && ROW(row_idx - 1)->span_open) {
+		in_span = true;
+		active_span = ROW(row_idx - 1)->span_rule;
+	}
+
+	while (pos < len) {
+		if (in_span) {
+			size_t end_from, end_to;
+			if (!syntax_find_match
+			    (&ec.syntax_span_compiled[active_span].end_compiled,
+			     row->render, pos, &end_from, &end_to)) {
+				syntax_fill_range(row, pos, len,
+						  ec.syntax_span_compiled
+						  [active_span].hl_code, false);
+				row->span_open = true;
+				row->span_rule = active_span;
+				return;
+			}
+			syntax_fill_range(row, pos, end_to,
+					  ec.syntax_span_compiled
+					  [active_span].hl_code, false);
+			pos = end_to;
+			in_span = false;
+			active_span = -1;
+			continue;
+		}
+
+		bool found_start = false;
+		size_t best_from = 0, best_to = 0;
+		int best_rule = 0;
+		for (size_t r = 0; r < ec.syntax_span_compiled_count; r++) {
+			size_t from, to;
+			if (!syntax_find_match
+			    (&ec.syntax_span_compiled[r].start_compiled,
+			     row->render, pos, &from, &to))
+				continue;
+			if (!found_start || from < best_from ||
+			    (from == best_from && (int)r < best_rule)) {
+				found_start = true;
+				best_from = from;
+				best_to = to;
+				best_rule = (int)r;
+			}
+		}
+		if (!found_start)
+			break;
+		{
+			size_t end_from, end_to;
+			if (!syntax_find_match
+			    (&ec.syntax_span_compiled[best_rule].end_compiled,
+			     row->render, best_to, &end_from, &end_to)) {
+				syntax_fill_range(row, best_from, len,
+						  ec.syntax_span_compiled
+						  [best_rule].hl_code, false);
+				row->span_open = true;
+				row->span_rule = best_rule;
+				return;
+			}
+			syntax_fill_range(row, best_from, end_to,
+					  ec.syntax_span_compiled
+					  [best_rule].hl_code, false);
+			pos = end_to;
+		}
+	}
+}
+
+static void syntax_highlight(editor_row_t *row, int row_idx);
+
+static void syntax_ensure_row_highlighted(int row_idx)
+{
+	int start = row_idx;
+	if (row_idx < 0 || row_idx >= NR)
+		return;
+	if (ROW(row_idx)->hl_valid)
+		return;
+	if (ec.syntax_span_compiled_count > 0)
+		while (start > 0 && !ROW(start - 1)->hl_valid)
+			start--;
+	for (int i = start; i <= row_idx; i++)
+		if (!ROW(i)->hl_valid)
+			syntax_highlight(ROW(i), i);
+}
+
+static void syntax_highlight(editor_row_t *row, int row_idx)
 {
 	row->highlight = realloc(row->highlight, row->render_size);
 	memset(row->highlight, NORMAL, row->render_size);
+	row->span_open = false;
+	row->span_rule = -1;
 	if (!ec.syntax)
+	{
+		row->hl_valid = true;
 		return;
-	const keyword_t *keywords = ec.syntax->keywords;
-	char *scs = ec.syntax->sl_comment_start;
-	char *mcs = ec.syntax->ml_comment_start;
-	char *mce = ec.syntax->ml_comment_end;
-	int scs_len = scs ? strlen(scs) : 0;
-	int mcs_len = mcs ? strlen(mcs) : 0;
-	int mce_len = mce ? strlen(mce) : 0;
-	bool prev_sep = true;
-	int in_string = 0;
-	bool in_comment = (row_idx > 0 && ROW(row_idx - 1)->hl_open_comment);
-	int i = 0;
-	while (i < row->render_size) {
-		char c = row->render[i];
-		unsigned char prev_highlight =
-		    (i > 0) ? row->highlight[i - 1] : NORMAL;
-		if (scs_len && !in_string && !in_comment) {
-			if (!strncmp(&row->render[i], scs, scs_len)) {
-				memset(&row->highlight[i], SL_COMMENT,
-				       row->render_size - i);
-				break;
-			}
-		}
-		if (mcs_len && mce_len && !in_string) {
-			if (in_comment) {
-				row->highlight[i] = ML_COMMENT;
-				if (!strncmp(&row->render[i], mce, mce_len)) {
-					memset(&row->highlight[i], ML_COMMENT,
-					       mce_len);
-					i += mce_len;
-					in_comment = 0;
-					prev_sep = true;
-					continue;
-				} else {
-					i++;
-					continue;
-				}
-			} else if (!strncmp(&row->render[i], mcs, mcs_len)) {
-				memset(&row->highlight[i], ML_COMMENT, mcs_len);
-				i += mcs_len;
-				in_comment = 1;
-				continue;
-			}
-		}
-		if (ec.syntax->flags & HIGHLIGHT_STRINGS) {
-			if (in_string) {
-				row->highlight[i] = STRING;
-				if ((c == '\\') && (i + 1 < row->render_size)) {
-					row->highlight[i + 1] = STRING;
-					i += 2;
-					continue;
-				}
-				if (c == in_string)
-					in_string = 0;
-				i++;
-				prev_sep = true;
-				continue;
-			} else {
-				if ((c == '"') || (c == '\'')) {
-					in_string = c;
-					row->highlight[i] = STRING;
-					i++;
-					continue;
-				}
-			}
-		}
-		if (ec.syntax->flags & HIGHLIGHT_NUMBERS) {
-			if ((isdigit(c)
-			     && (prev_sep || (prev_highlight == NUMBER)))
-			    || (syntax_is_number_part(c)
-				&& (prev_highlight == NUMBER))) {
-				row->highlight[i] = NUMBER;
-				i++;
-				prev_sep = false;
-				continue;
-			}
-		}
-		if (prev_sep) {
-			const keyword_t *kw;
-			for (kw = keywords; kw->str; kw++) {
-				if (!strncmp(&row->render[i], kw->str, kw->len)
-				    && syntax_is_separator(row->
-							   render[i +
-								  kw->len])) {
-					memset(&row->highlight[i], kw->type,
-					       kw->len);
-					i += kw->len;
-					break;
-				}
-			}
-			if (kw->str) {
-				prev_sep = false;
-				continue;
-			}
-		}
-		prev_sep = syntax_is_separator(c);
-		i++;
 	}
-	bool changed = (row->hl_open_comment != in_comment);
-	row->hl_open_comment = in_comment;
-	if (changed && row_idx + 1 < NR)
-		syntax_highlight(ROW(row_idx + 1), row_idx + 1);
+	syntax_apply_rules(row);
+	syntax_apply_span_rules(row, row_idx);
+	row->hl_valid = true;
 }
 
-/* Reference: https://misc.flogisoft.com/bash/tip_colors_and_formatting */
-static int syntax_token_color(int highlight)
+static bool syntax_match_regex(const char *pattern, const char *text)
 {
-	/* Generate color mapping using X-macro */
-	static const int highlight_colors[] = {
-#define _(type, color, desc) [type] = color,
-		HIGHLIGHT_TYPES
-#undef _
-	};
+	regex_t rx = NULL;
+	bool ok = false;
 
-	if (highlight >= 0 && highlight < HIGHLIGHT_COUNT)
-		return highlight_colors[highlight];
-	return 97;		/* Default white */
+	if (!pattern || !*pattern || !text)
+		return false;
+	if (regcomp(&rx, pattern, REG_EXTENDED | REG_NOSUB) != 0)
+		return false;
+	ok = (regexec(&rx, text, 0, NULL, 0) == 0);
+	regfree(&rx);
+	return ok;
 }
 
 static void syntax_select(void)
 {
+	syntax_reset_compiled_rules();
 	ec.syntax = NULL;
+	syntax_invalidate_all_rows();
 	if (!ec.file_name)
 		return;
-	for (size_t j = 0; j < DB_ENTRIES; j++) {
-		editor_syntax_t *es = &DB[j];
-		for (size_t i = 0; es->file_match[i]; i++) {
-			char *p = strstr(ec.file_name, es->file_match[i]);
-			if (!p)
+	for (size_t j = 0; syntax_rules[j].file_regex; j++) {
+		if (syntax_match_regex(syntax_rules[j].file_regex, ec.file_name)) {
+			ec.syntax = &syntax_rules[j];
+			break;
+		}
+	}
+	if (!ec.syntax && NR > 0) {
+		const char *first_line = ROW(0)->chars;
+		for (size_t j = 0; syntax_rules[j].file_regex; j++) {
+			if (syntax_match_regex(syntax_rules[j].file_magic,
+					       first_line)) {
+				ec.syntax = &syntax_rules[j];
+				break;
+			}
+		}
+	}
+	if (!ec.syntax)
+		return;
+	{
+		size_t single_count = 0;
+		size_t span_count = 0;
+		size_t single_idx = 0;
+		size_t span_idx = 0;
+
+		for (size_t i = 0; i < ec.syntax->rule_count; i++) {
+			const struct syntax_rule *rule = &ec.syntax->rules[i];
+			if (!rule->regex || (rule->fg == COLOR_NONE &&
+					     rule->bg == COLOR_NONE))
 				continue;
-			int pat_len = strlen(es->file_match[i]);
-			if ((es->file_match[i][0] != '.')
-			    || (p[pat_len] == '\0')) {
-				ec.syntax = es;
-				for (int file_row = 0; file_row < NR;
-				     file_row++)
-					syntax_highlight(ROW(file_row),
-							 file_row);
+			if (rule->end_regex)
+				span_count++;
+			else
+				single_count++;
+		}
+
+		if (single_count > 0) {
+			ec.syntax_compiled =
+			    calloc(single_count, sizeof(*ec.syntax_compiled));
+			if (!ec.syntax_compiled)
+				return;
+		}
+		if (span_count > 0) {
+			ec.syntax_span_compiled =
+			    calloc(span_count, sizeof(*ec.syntax_span_compiled));
+			if (!ec.syntax_span_compiled) {
+				free(ec.syntax_compiled);
+				ec.syntax_compiled = NULL;
 				return;
 			}
 		}
+
+		for (size_t i = 0; i < ec.syntax->rule_count; i++) {
+			const struct syntax_rule *rule = &ec.syntax->rules[i];
+			unsigned char hl_code;
+
+			if (!rule->regex || (rule->fg == COLOR_NONE &&
+					     rule->bg == COLOR_NONE))
+				continue;
+			hl_code = syntax_palette_code(rule->fg, rule->bg);
+			if (hl_code == NORMAL)
+				continue;
+
+			if (rule->end_regex) {
+				regex_t start_rx = NULL;
+				regex_t end_rx = NULL;
+				if (regcomp(&start_rx, rule->regex,
+					    REG_EXTENDED) != 0)
+					continue;
+				if (regcomp(&end_rx, rule->end_regex,
+					    REG_EXTENDED) != 0) {
+					regfree(&start_rx);
+					continue;
+				}
+				ec.syntax_span_compiled[span_idx].start_compiled =
+				    start_rx;
+				ec.syntax_span_compiled[span_idx].end_compiled =
+				    end_rx;
+				ec.syntax_span_compiled[span_idx].valid_start =
+				    true;
+				ec.syntax_span_compiled[span_idx].valid_end = true;
+				ec.syntax_span_compiled[span_idx].hl_code =
+				    hl_code;
+				span_idx++;
+			} else {
+				regex_t rule_rx = NULL;
+				if (regcomp(&rule_rx, rule->regex,
+					    REG_EXTENDED) != 0)
+					continue;
+				ec.syntax_compiled[single_idx].compiled = rule_rx;
+				ec.syntax_compiled[single_idx].valid = true;
+				ec.syntax_compiled[single_idx].hl_code = hl_code;
+				single_idx++;
+			}
+		}
+		ec.syntax_compiled_count = single_idx;
+		ec.syntax_span_compiled_count = span_idx;
 	}
 }
 
@@ -1297,7 +1495,12 @@ static void row_update(editor_row_t * row, int row_idx)
 	}
 	row->render[idx] = '\0';
 	row->render_size = idx;
-	syntax_highlight(row, row_idx);
+	if (ec.syntax_span_compiled_count > 0) {
+		for (int i = row_idx; i < NR; i++)
+			ROW(i)->hl_valid = false;
+	} else {
+		row->hl_valid = false;
+	}
 }
 
 static void row_insert(int at, const char *s, size_t line_len)
@@ -2229,6 +2432,31 @@ static char *file_rows_to_string(int *buf_len)
 	return buf;
 }
 
+static void browser_set_base_dir_from_path(const char *path)
+{
+	if (!path || !*path) {
+		snprintf(ec.browser_base_dir, sizeof(ec.browser_base_dir), ".");
+		return;
+	}
+	char tmp[PATH_MAX];
+	snprintf(tmp, sizeof(tmp), "%s", path);
+	size_t len = strlen(tmp);
+	while (len > 1 && tmp[len - 1] == '/') {
+		tmp[len - 1] = '\0';
+		len--;
+	}
+	char *slash = strrchr(tmp, '/');
+	if (!slash) {
+		snprintf(ec.browser_base_dir, sizeof(ec.browser_base_dir), ".");
+	} else if (slash == tmp) {
+		snprintf(ec.browser_base_dir, sizeof(ec.browser_base_dir), "/");
+	} else {
+		*slash = '\0';
+		snprintf(ec.browser_base_dir, sizeof(ec.browser_base_dir), "%s",
+			 tmp);
+	}
+}
+
 static void file_open(const char *file_name)
 {
 	undo_history_clear();
@@ -2242,9 +2470,11 @@ static void file_open(const char *file_name)
 	ec.row_offset = 0;
 	ec.col_offset = 0;
 	ec.render_x = 0;
+	ec.file_size_bytes = 0;
 
 	free(ec.file_name);
 	ec.file_name = strdup(file_name);
+	browser_set_base_dir_from_path(file_name);
 	syntax_select();
 	FILE *file = fopen(file_name, "r+");
 	if (!file) {
@@ -2258,13 +2488,27 @@ static void file_open(const char *file_name)
 	size_t line_cap = 0;
 	ssize_t line_len;
 	while ((line_len = getline(&line, &line_cap, file)) != -1) {
+		ec.file_size_bytes += (size_t) line_len;
 		if (line_len > 0 &&
 		    (line[line_len - 1] == '\n' || line[line_len - 1] == '\r'))
 			line_len--;
 		row_insert(NR, line, line_len);
+		if (ec.syntax
+		    && ec.file_size_bytes > SYNTAX_AUTO_DISABLE_THRESHOLD) {
+			syntax_disable(false);
+			ui_set_message
+			    ("Syntax highlighting auto-disabled above %u MiB",
+			     (unsigned) (SYNTAX_AUTO_DISABLE_THRESHOLD >> 20));
+		}
 	}
 	free(line);
 	fclose(file);
+	syntax_select();
+	if (ec.syntax && ec.file_size_bytes > SYNTAX_AUTO_DISABLE_THRESHOLD) {
+		syntax_disable(false);
+		ui_set_message("Syntax highlighting auto-disabled above %u MiB",
+			       (unsigned) (SYNTAX_AUTO_DISABLE_THRESHOLD >> 20));
+	}
 	ec.modified = false;
 }
 
@@ -2279,6 +2523,7 @@ static void file_save(void)
 	bool name_changed = !ec.file_name || strcmp(ec.file_name, name) != 0;
 	free(ec.file_name);
 	ec.file_name = name;
+	browser_set_base_dir_from_path(ec.file_name);
 	if (name_changed)
 		syntax_select();
 	int len;
@@ -2307,6 +2552,8 @@ static void file_save(void)
 static void search_highlight_match(int row_idx, int match_offset, int match_len)
 {
 	editor_row_t *r = ROW(row_idx);
+	if (r && !r->hl_valid)
+		syntax_ensure_row_highlighted(row_idx);
 	if (!r->highlight || r->render_size <= 0)
 		return;
 
@@ -3021,23 +3268,26 @@ static void ui_draw_rows(editor_buf_t * eb)
 		if (file_row >= NR) {
 			buf_append(eb, "~", 1);
 		} else {
+			editor_row_t *row = ROW(file_row);
+			if (!row->hl_valid)
+				syntax_ensure_row_highlighted(file_row);
 			int available_cols = ec.screen_cols - line_num_width;
-			int len = ROW(file_row)->render_size - ec.col_offset;
+			int len = row->render_size - ec.col_offset;
 			if (len < 0)
 				len = 0;
 			if (len > available_cols)
 				len = available_cols;
-			char *c = ROW(file_row)->render + ec.col_offset;
-			unsigned char *hl =
-			    ROW(file_row)->highlight + ec.col_offset;
-			int current_color = -1;
+			char *c = row->render + ec.col_offset;
+			unsigned char *hl = row->highlight + ec.col_offset;
+			unsigned char current_style = NORMAL;
 			bool in_selection = false;
+			int prev_tab_cursor_x = -1;
+			bool prev_tab_cursor_x_valid = false;
 
 			for (int j = 0; j < len; j++) {
 				/* Check if this character is in selection */
 				int cursor_x =
-				    row_renderx_to_cursorx(ROW(file_row),
-							   ec.col_offset + j);
+				    row_renderx_to_cursorx(row, ec.col_offset + j);
 				bool is_selected =
 				    selection_contains(cursor_x, file_row);
 
@@ -3052,54 +3302,81 @@ static void ui_draw_rows(editor_buf_t * eb)
 					in_selection = false;
 				}
 
-				if (iscntrl(c[j])) {
+				int render_pos = ec.col_offset + j;
+				int tab_cursor_x =
+				    row_renderx_to_cursorx(row, render_pos);
+				int prev_cursor_x = prev_tab_cursor_x_valid ?
+				    prev_tab_cursor_x : ((render_pos > 0) ?
+							 row_renderx_to_cursorx
+							 (row, render_pos - 1) :
+							 -1);
+				bool tab_head =
+				    tab_cursor_x < row->size
+				    && row->chars[tab_cursor_x] == '\t'
+				    && (render_pos == 0
+					|| prev_cursor_x != tab_cursor_x);
+				prev_tab_cursor_x = tab_cursor_x;
+				prev_tab_cursor_x_valid = true;
+				if (ec.show_whitespace && tab_head) {
+					if (!in_selection)
+						buf_append(eb, TAB_HEAD_STYLE,
+							   sizeof(TAB_HEAD_STYLE)
+							   - 1);
+					buf_append(eb, "\xC2\xBB", 2);
+					if (!in_selection) {
+						if (current_style != NORMAL) {
+							char buf[16];
+							int c_len =
+							    syntax_style_escape
+							    (current_style, buf,
+							     sizeof(buf));
+							buf_append(eb, buf, c_len);
+						} else {
+							buf_append(eb,
+								   "\x1b[39;49m",
+								   8);
+						}
+					}
+				} else if (iscntrl(c[j])) {
 					char sym =
 					    (c[j] <= 26) ? '@' + c[j] : '?';
 					buf_append(eb, "\x1b[7m", 4);
 					buf_append(eb, &sym, 1);
 					buf_append(eb, "\x1b[m", 3);
-					if (current_color != -1) {
+					if (current_style != NORMAL) {
 						char buf[16];
-						int c_len =
-						    snprintf(buf, sizeof(buf),
-							     "\x1b[%dm",
-							     current_color);
+						int c_len = syntax_style_escape(
+							current_style, buf,
+							sizeof(buf));
 						buf_append(eb, buf, c_len);
 					}
 				} else if (hl[j] == NORMAL) {
-					if (current_color != -1) {
-						buf_append(eb, "\x1b[39m", 5);
-						current_color = -1;
+					if (current_style != NORMAL) {
+						buf_append(eb, "\x1b[39;49m", 8);
+						current_style = NORMAL;
 					}
 					buf_append(eb, &c[j], 1);
 				} else {
-					int color = syntax_token_color(hl[j]);
 					if (hl[j] == MATCH) {
 						/* Use inverse video for search matches */
 						buf_append(eb, "\x1b[7m", 4);
 						buf_append(eb, &c[j], 1);
 						buf_append(eb, "\x1b[27m", 5);
-						if (current_color != -1) {
+						if (current_style != NORMAL) {
 							char buf[16];
-							int c_len =
-							    snprintf(buf,
-								     sizeof
-								     (buf),
-								     "\x1b[%dm",
-								     current_color);
+							int c_len = syntax_style_escape(
+								current_style, buf,
+								sizeof(buf));
 							buf_append(eb, buf,
 								   c_len);
 						}
 					} else {
-						if (color != current_color) {
-							current_color = color;
+						if (hl[j] != current_style) {
+							current_style = hl[j];
 							char buf[16];
-							int c_len =
-							    snprintf(buf,
-								     sizeof
-								     (buf),
-								     "\x1b[%dm",
-								     color);
+							int c_len = syntax_style_escape(
+								hl[j], buf,
+								sizeof(buf));
 							buf_append(eb, buf,
 								   c_len);
 						}
@@ -3110,7 +3387,7 @@ static void ui_draw_rows(editor_buf_t * eb)
 			/* Ensure selection highlighting is turned off at end of line */
 			if (in_selection)
 				buf_append(eb, "\x1b[27m", 5);
-			buf_append(eb, "\x1b[39m", 5);
+			buf_append(eb, "\x1b[39;49m", 8);
 		}
 		buf_append(eb, "\x1b[K", 3);
 		buf_append(eb, "\r\n", 2);
@@ -3452,6 +3729,50 @@ static void editor_move_cursor(int key)
 		ec.cursor_x = row_len;
 }
 
+static void editor_goto_matching_bracket(void)
+{
+	static const char brackets[] = "{}()[]";
+	int row = ec.cursor_y;
+	int col = ec.cursor_x;
+	int idx = -1;
+	int dir;
+	int depth = 0;
+
+	/* could do this in one line with strchr but we don't use it elsewhere
+	   so pulling it in for this one case would make the binary bigger. */
+	for (int i = 0; i < (int)sizeof(brackets) - 1; i++) {
+		if (ROW(row)->chars[col] == brackets[i]) {
+			idx = i;
+			break;
+		}
+	}
+	if (idx < 0)
+		goto not_found;
+
+	dir = (idx & 1) ? -1 : 1;
+
+	for (int y = row; y < NR && y >= 0; y += dir) {
+		editor_row_t *r = ROW(y);
+		int x0 = (y == row) ? col + dir : (y > 0 ? 0 : r->size - 1);
+		for (int x = x0; x < r->size && x >= 0; x += dir) {
+			char c = r->chars[x];
+			if (c == brackets[idx]) {
+				depth++;
+			} else if (c == brackets[idx+dir]) {
+				if (depth == 0) {
+					ec.cursor_y = y;
+					ec.cursor_x = x;
+					return;
+				}
+				depth--;
+			}
+		}
+	}
+
+ not_found:
+	set_overlay_msg("[ No matching bracket ]");
+}
+
 /* File browser implementation */
 
 /* Get file extension */
@@ -3464,28 +3785,26 @@ static const char *get_file_extension(const char *filename)
 }
 
 /* Get file type indicator and color */
-static const char *get_file_type_info(const char *filename, int *color)
+static const char *get_file_type_info(const char *filename, bool is_dir, int *color)
 {
-	if (filename[0] == '/') {
+	static const char source_exts[][5] = {
+		"c", "h", "cpp", "cxx", "hpp", "cc", "sh", "py", "rb",
+		"js", "rs", "go", "java", "php", "pl", "lua", "vim", "asm",
+		"s"
+	};
+
+	if (is_dir) {
 		*color = 34;	/* Blue for directories */
 		return "[DIR]  ";
 	}
 
 	const char *ext = get_file_extension(filename);
 
-	/* Source and script files */
-	if (!strcasecmp(ext, "c") || !strcasecmp(ext, "h") ||
-	    !strcasecmp(ext, "cpp") || !strcasecmp(ext, "cxx") ||
-	    !strcasecmp(ext, "hpp") || !strcasecmp(ext, "cc") ||
-	    !strcasecmp(ext, "sh") || !strcasecmp(ext, "py") ||
-	    !strcasecmp(ext, "rb") || !strcasecmp(ext, "js") ||
-	    !strcasecmp(ext, "rs") || !strcasecmp(ext, "go") ||
-	    !strcasecmp(ext, "java") || !strcasecmp(ext, "php") ||
-	    !strcasecmp(ext, "pl") || !strcasecmp(ext, "lua") ||
-	    !strcasecmp(ext, "vim") || !strcasecmp(ext, "asm") ||
-	    !strcasecmp(ext, "s")) {
-		*color = 32;	/* Green for source */
-		return "[SRC]  ";
+	for (size_t i = 0; i < sizeof(source_exts) / sizeof(source_exts[0]); i++) {
+		if (!strcasecmp(ext, source_exts[i])) {
+			*color = 32;	/* Green for source */
+			return "[SRC]  ";
+		}
 	}
 
 	/* All other files */
@@ -3496,113 +3815,89 @@ static const char *get_file_type_info(const char *filename, int *color)
 static void browser_free_entries(void)
 {
 	if (ec.mode_state.browser.entries) {
-		for (int i = 0; i < ec.mode_state.browser.num_entries; i++)
-			free(ec.mode_state.browser.entries[i]);
-		free(ec.mode_state.browser.entries);
+		tlist_free(ec.mode_state.browser.entries);
 		ec.mode_state.browser.entries = NULL;
-		ec.mode_state.browser.num_entries = 0;
 	}
-	free(ec.mode_state.browser.current_dir);
-	ec.mode_state.browser.current_dir = NULL;
+	ec.mode_state.browser.current_dir[0] = '\0';
 }
 
-static int browser_compare_entries(const void *a, const void *b)
+static int browser_entry_cmp(const void *ap, const void *bp)
 {
-	const char *name_a = *(const char **)a, *name_b = *(const char **)b;
-
-	/* Directories first (start with '/'), then files */
-	bool is_dir_a = (name_a[0] == '/');
-	bool is_dir_b = (name_b[0] == '/');
-
-	if (is_dir_a && !is_dir_b)
+	const browser_entry_t *a = (const browser_entry_t *)ap;
+	const browser_entry_t *b = (const browser_entry_t *)bp;
+	if (a->is_dir && !b->is_dir)
 		return -1;
-	if (!is_dir_a && is_dir_b)
+	if (!a->is_dir && b->is_dir)
 		return 1;
+	return strcasecmp(a->name, b->name);
+}
 
-	/* Compare names, ignoring the '/' prefix for directories */
-	const char *cmp_a = is_dir_a ? name_a + 1 : name_a;
-	const char *cmp_b = is_dir_b ? name_b + 1 : name_b;
-
-	return strcasecmp(cmp_a, cmp_b);
+static bool path_join(char *dst, size_t dstsz, const char *base, const char *name)
+{
+	size_t blen = strlen(base), nlen = strlen(name);
+	bool need_slash = (blen == 0 || base[blen - 1] != '/');
+	size_t need = blen + (need_slash ? 1 : 0) + nlen + 1;
+	if (need > dstsz)
+		return false;
+	memcpy(dst, base, blen);
+	size_t off = blen;
+	if (need_slash)
+		dst[off++] = '/';
+	memcpy(dst + off, name, nlen);
+	dst[off + nlen] = '\0';
+	return true;
 }
 
 static void browser_load_directory(const char *path)
 {
+	const char *dir_path = path ? path : ".";
 	browser_free_entries();
 
-	DIR *dir = opendir(path ? path : ".");
+	DIR *dir = opendir(dir_path);
 	if (!dir) {
 		ui_set_message("Cannot open directory: %s", strerror(errno));
 		mode_set(MODE_NORMAL);
 		return;
 	}
 
-	/* Store current directory */
-	ec.mode_state.browser.current_dir = strdup(path ? path : ".");
-
-	/* Count entries first */
-	int capacity = 32;
-	ec.mode_state.browser.entries = malloc(sizeof(char *) * capacity);
-	ec.mode_state.browser.num_entries = 0;
-
-	/* Add parent directory if not root */
-	if (strcmp(ec.mode_state.browser.current_dir, "/")) {
-		ec.mode_state.browser.entries[ec.mode_state.browser.
-					      num_entries++] = strdup("/..");
+	snprintf(ec.mode_state.browser.current_dir,
+		 sizeof(ec.mode_state.browser.current_dir), "%s", dir_path);
+	ec.mode_state.browser.entries = tlist_new(sizeof(browser_entry_t));
+	if (!ec.mode_state.browser.entries) {
+		closedir(dir);
+		mode_set(MODE_NORMAL);
+		ui_set_message("Out of memory");
+		return;
 	}
 
 	struct dirent *de;
 	while ((de = readdir(dir)) != NULL) {
-		/* Skip current and parent directory entries */
-		if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+		if (!strcmp(de->d_name, "."))
 			continue;
 
-		/* Skip hidden files if show_hidden is false */
-		if (!ec.mode_state.browser.show_hidden && de->d_name[0] == '.')
+		if (!ec.mode_state.browser.show_hidden && de->d_name[0] == '.'
+		    && strcmp(de->d_name, ".."))
 			continue;
 
-		/* Check if we need to resize array */
-		if (ec.mode_state.browser.num_entries >= capacity - 1) {
-			capacity *= 2;
-			ec.mode_state.browser.entries =
-			    realloc(ec.mode_state.browser.entries,
-				    sizeof(char *) * capacity);
-		}
-
-		/* Get file info to determine if it's a directory */
 		char full_path[PATH_MAX];
-		snprintf(full_path, sizeof(full_path), "%s/%s",
-			 ec.mode_state.browser.current_dir, de->d_name);
+		if (!path_join(full_path, sizeof(full_path),
+			       ec.mode_state.browser.current_dir, de->d_name))
+			continue;
 
 		struct stat st;
 		if (stat(full_path, &st) == 0) {
-			if (S_ISDIR(st.st_mode)) {
-				/* Directory - prefix with '/' */
-				char *entry = malloc(strlen(de->d_name) + 2);
-				sprintf(entry, "/%s", de->d_name);
-				ec.mode_state.browser.entries[ec.mode_state.
-							      browser.
-							      num_entries++] =
-				    entry;
-			} else if (S_ISREG(st.st_mode)) {
-				/* Regular file */
-				ec.mode_state.browser.entries[ec.mode_state.
-							      browser.
-							      num_entries++] =
-				    strdup(de->d_name);
-			}
+			if (!S_ISDIR(st.st_mode) && !S_ISREG(st.st_mode))
+				continue;
+			browser_entry_t e;
+			snprintf(e.name, sizeof(e.name), "%s", de->d_name);
+			e.is_dir = S_ISDIR(st.st_mode);
+			if (!tlist_insert_sorted(ec.mode_state.browser.entries, &e,
+						 browser_entry_cmp))
+				break;
 		}
 	}
 
 	closedir(dir);
-
-	/* Sort entries: directories first, then files, both alphabetically */
-	if (ec.mode_state.browser.num_entries > 0) {
-		qsort(ec.mode_state.browser.entries,
-		      ec.mode_state.browser.num_entries, sizeof(char *),
-		      browser_compare_entries);
-	}
-
 	ec.mode_state.browser.selected = 0;
 	ec.mode_state.browser.offset = 0;
 }
@@ -3610,7 +3905,7 @@ static void browser_load_directory(const char *path)
 /* Shared rendering for help and browser screens */
 static void list_screen_render(const char *title, int total_lines, int offset,
 			       int selected, const char *const *lines,
-			       char **entries, const char *status_left,
+			       tlist *entries, const char *status_left,
 			       const char *status_right)
 {
 	editor_buf_t eb = { NULL, 0 };
@@ -3637,19 +3932,20 @@ static void list_screen_render(const char *title, int total_lines, int offset,
 		if (idx < total_lines) {
 			if (entries) {
 				/* Browser mode: format entry with icon and color */
-				char *entry = entries[idx];
+				browser_entry_t *entry =
+				    (browser_entry_t *) tlist_get(entries, (size_t) idx);
+				if (!entry)
+					continue;
 				int color;
 				const char *type_str =
-				    get_file_type_info(entry, &color);
+				    get_file_type_info(entry->name, entry->is_dir, &color);
 				if (idx == selected)
 					buf_append(&eb, "\x1b[7m", 4);
 				char line[512];
 				int llen =
 				    snprintf(line, sizeof(line),
 					     "\x1b[%dm  %s%s\x1b[0m",
-					     color, type_str,
-					     entry[0] ==
-					     '/' ? entry + 1 : entry);
+					     color, type_str, entry->name);
 				if (llen >= (int)sizeof(line))
 					llen = sizeof(line) - 1;
 				if (llen > ec.screen_cols)
@@ -3699,36 +3995,32 @@ static void list_screen_render(const char *title, int total_lines, int offset,
 
 static void browser_open_selected(void)
 {
-	if (ec.mode_state.browser.selected >= ec.mode_state.browser.num_entries)
+	int count = (int)tlist_getsize(ec.mode_state.browser.entries);
+	if (ec.mode_state.browser.selected >= count)
 		return;
-	char *entry =
-	    ec.mode_state.browser.entries[ec.mode_state.browser.selected];
+	browser_entry_t *entry =
+	    (browser_entry_t *) tlist_get(ec.mode_state.browser.entries,
+					  (size_t) ec.mode_state.browser.selected);
 	if (!entry)
 		return;
 
-	if (entry[0] == '/') {
+	if (entry->is_dir) {
 		/* Directory */
 		char new_path[PATH_MAX];
-		if (!strcmp(entry, "/..")) {
-			const char *cur = ec.mode_state.browser.current_dir;
-			char *last_slash = strrchr(cur, '/');
-			if (last_slash && last_slash != cur) {
-				snprintf(new_path, sizeof(new_path), "%.*s",
-					 (int)(last_slash - cur), cur);
-				browser_load_directory(new_path);
-			} else {
-				browser_load_directory("/");
-			}
-		} else {
-			snprintf(new_path, sizeof(new_path), "%s%s",
-				 ec.mode_state.browser.current_dir, entry);
-			browser_load_directory(new_path);
+		if (!path_join(new_path, sizeof(new_path),
+			       ec.mode_state.browser.current_dir, entry->name)) {
+			ui_set_message("Path too long");
+			return;
 		}
+		browser_load_directory(new_path);
 	} else {
 		/* File - open it */
 		char full_path[PATH_MAX];
-		snprintf(full_path, sizeof(full_path), "%s/%s",
-			 ec.mode_state.browser.current_dir, entry);
+		if (!path_join(full_path, sizeof(full_path),
+			       ec.mode_state.browser.current_dir, entry->name)) {
+			ui_set_message("Path too long");
+			return;
+		}
 		if (ec.modified) {
 			int r =
 			    ui_confirm
@@ -3764,6 +4056,7 @@ static void help_render(void)
 static void browser_render(void)
 {
 	/* Adjust offset to keep selected item visible */
+	int count = (int)tlist_getsize(ec.mode_state.browser.entries);
 	int visible = ec.screen_rows - 1;
 	if (ec.mode_state.browser.selected < ec.mode_state.browser.offset)
 		ec.mode_state.browser.offset = ec.mode_state.browser.selected;
@@ -3773,16 +4066,15 @@ static void browser_render(void)
 		    ec.mode_state.browser.selected - visible + 1;
 
 	char title[256], status_right[80];
-	snprintf(title, sizeof(title), " [BROWSER] %s",
+	snprintf(title, sizeof(title), " [BROWSER] %.240s",
 		 ec.mode_state.browser.current_dir);
-	if (ec.mode_state.browser.num_entries > 0) {
+	if (count > 0) {
 		snprintf(status_right, sizeof(status_right), "%d/%d files",
-			 ec.mode_state.browser.selected + 1,
-			 ec.mode_state.browser.num_entries);
+			 ec.mode_state.browser.selected + 1, count);
 	} else {
 		snprintf(status_right, sizeof(status_right), "0/0 files");
 	}
-	list_screen_render(title, ec.mode_state.browser.num_entries,
+	list_screen_render(title, count,
 			   ec.mode_state.browser.offset,
 			   ec.mode_state.browser.selected, NULL,
 			   ec.mode_state.browser.entries, title, status_right);
@@ -3814,6 +4106,7 @@ static void editor_cleanup(void)
 	ec.mode_state.search.saved_highlight = NULL;
 	free(ec.mode_state.prompt.buffer);
 	ec.mode_state.prompt.buffer = NULL;
+	syntax_reset_compiled_rules();
 	browser_free_entries();
 }
 
@@ -3856,12 +4149,15 @@ static void editor_process_key(void)
 			browser_render();
 			return;
 		case ARROW_DOWN:
+		{
+			int count = (int)tlist_getsize(ec.mode_state.browser.entries);
 			if (ec.mode_state.browser.selected <
-			    ec.mode_state.browser.num_entries - 1) {
+			    count - 1) {
 				ec.mode_state.browser.selected++;
 			}
 			browser_render();
 			return;
+		}
 		case PAGE_UP:
 			ec.mode_state.browser.selected -= ec.screen_rows - 3;
 			if (ec.mode_state.browser.selected < 0)
@@ -3869,22 +4165,27 @@ static void editor_process_key(void)
 			browser_render();
 			return;
 		case PAGE_DOWN:
+		{
+			int count = (int)tlist_getsize(ec.mode_state.browser.entries);
 			ec.mode_state.browser.selected += ec.screen_rows - 3;
-			if (ec.mode_state.browser.selected >=
-			    ec.mode_state.browser.num_entries)
-				ec.mode_state.browser.selected =
-				    ec.mode_state.browser.num_entries - 1;
+			if (ec.mode_state.browser.selected >= count)
+				ec.mode_state.browser.selected = count - 1;
+			if (ec.mode_state.browser.selected < 0)
+				ec.mode_state.browser.selected = 0;
 			browser_render();
 			return;
+		}
 		case HOME_KEY:
 			ec.mode_state.browser.selected = 0;
 			browser_render();
 			return;
 		case END_KEY:
-			ec.mode_state.browser.selected =
-			    ec.mode_state.browser.num_entries - 1;
+		{
+			int count = (int)tlist_getsize(ec.mode_state.browser.entries);
+			ec.mode_state.browser.selected = count > 0 ? count - 1 : 0;
 			browser_render();
 			return;
+		}
 		case 'h':
 		case 'H':
 			/* Toggle hidden files */
@@ -4287,15 +4588,39 @@ static void editor_process_key(void)
 	case CTRL_('w'):	/* Find/search (GNU nano: ^W Where Is) */
 		search_find();
 		return;		/* editor_refresh() already called inside search_find */
-	case CTRL_('n'):	/* Toggle line numbers */
+	case META_('#'):	/* Toggle line numbers */
 		ec.show_line_numbers = !ec.show_line_numbers;
 		ui_set_message("Line numbers %s",
 			       ec.show_line_numbers ? "enabled" : "disabled");
 		break;
+	case META_('p'):
+	case META_('P'):	/* Toggle whitespace display */
+		ec.show_whitespace = !ec.show_whitespace;
+		ui_set_message("Whitespace display %s",
+			       ec.show_whitespace ? "enabled" : "disabled");
+		break;
+	case META_('y'):
+	case META_('Y'):	/* Toggle syntax highlighting display */
+		if (ec.syntax) {
+			syntax_disable(true);
+		} else {
+			syntax_select();
+			if (ec.syntax && ec.file_size_bytes > SYNTAX_AUTO_DISABLE_THRESHOLD) {
+				syntax_disable(false);
+				ui_set_message
+				    ("Syntax highlighting auto-disabled above %u MiB",
+				     (unsigned) (SYNTAX_AUTO_DISABLE_THRESHOLD >> 20));
+			} else {
+				ui_set_message("Syntax highlighting %s",
+					       ec.syntax ? "enabled" :
+					       "not available");
+			}
+		}
+		break;
 	case META_('b'):
 	case META_('B'):	/* Open file browser (M-B) */
 		mode_set(MODE_BROWSER);
-		browser_load_directory(".");
+		browser_load_directory(ec.browser_base_dir);
 		ui_set_message("File Browser: Enter to open, ^C to cancel");
 		browser_render();
 		return;		/* Don't continue to normal refresh */
@@ -4328,6 +4653,9 @@ static void editor_process_key(void)
 			}
 			break;
 		}
+	case META_(']'):	/* M-] Go to matching bracket */
+		editor_goto_matching_bracket();
+		break;
 	case CTRL_('g'):	/* Show help (GNU nano: ^G) */
 		mode_set(MODE_HELP);
 		help_render();
@@ -4345,6 +4673,9 @@ static void editor_process_key(void)
 	case '{':
 		editor_insert_char(c, true);
 		indent_level++;
+		break;
+	case '\t':
+		editor_insert_char('\t', true);
 		break;
 	case '}':
 		if (ec.cursor_y == NR)
@@ -4369,6 +4700,7 @@ static void editor_process_key(void)
 
 static void editor_init(void)
 {
+	init_ec();
 	term_update_size();
 	signal(SIGWINCH, sig_winch_handler);
 	signal(SIGCONT, sig_cont_handler);

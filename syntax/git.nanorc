@@ -1,0 +1,10 @@
+syntax "gitconfig" "git(config|modules)$|\.git/config$"
+
+color brightcyan "\<(true|false)\>"
+color brightblack "^[[:space:]]*[^=]*="
+color brightmagenta "^[[:space:]]*\[.*\]$"
+color yellow ""(\\.|[^"])*"|'(\\.|[^'])*'"
+color cyan "(^|[[:space:]])#([^{].*)?$"
+color ,green "[[:space:]]+$"
+color ,red "	+ +| +	+"
+# +EXTRALINT
